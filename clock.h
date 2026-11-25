@@ -103,6 +103,16 @@ int (*clock_dscmp(struct clock *c))(struct dataset *a, struct dataset *b);
  */
 int clock_required_modes(struct clock *c);
 
+#ifdef MCHP_APR
+/**
+ * Obtain the UDP socket used to forward time stamps to the Advanced
+ * Phase Recovery algorithm.
+ * @param c  The clock instance.
+ * @return   The socket file descriptor.
+ */
+int clock_get_apr_socket(struct clock *c);
+#endif
+
 /**
  * Create a clock instance. There can only be one clock in any system,
  * so subsequent calls will destroy the previous clock instance.

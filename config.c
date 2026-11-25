@@ -404,6 +404,9 @@ struct config_item config_tab[] = {
 	GLOB_ITEM_INT("utc_offset", CURRENT_UTC_OFFSET, 0, INT_MAX),
 	GLOB_ITEM_INT("verbose", 0, 0, 1),
 	GLOB_ITEM_INT("write_phase_mode", 0, 0, 1),
+#ifdef MCHP_APR
+	GLOB_ITEM_INT("apr_timestamp_port", 55555, 1, 65535),
+#endif
 };
 
 static struct unicast_master_table *current_uc_mtab;

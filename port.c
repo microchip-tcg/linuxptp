@@ -24,6 +24,14 @@
 #include <unistd.h>
 #include <sys/queue.h>
 #include <net/if.h>
+#ifdef MCHP_APR
+#include <netinet/in.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <linux/ptp_clock.h>
+#include <stddef.h>
+#include <stdint.h>
+#endif
 
 #include "bmc.h"
 #include "clock.h"
@@ -49,6 +57,64 @@
 #define ANNOUNCE_SPAN 1
 #define CMLDS_SUBSCRIPTION_INTERVAL	60 /*seconds*/
 #define CMLDS_UPDATE_INTERVAL		(CMLDS_SUBSCRIPTION_INTERVAL / 2)
+
+#ifdef MCHP_APR
+#define MCHP_APR_TIMESTAMP_PORT		55555
+
+enum mchp_apr_direction {
+	APR_FORWARD = 1,	/* Sync: T1, T2 */
+	APR_REVERSE = 2,	/* Delay Req/Resp: T3, T4 */
+};
+
+enum mchp_apr_sync_mode {
+	APR_SYNC_NOT_APPLICABLE = 0,  /* Record is not a Sync message, e.g. Delay_Resp. */
+	APR_SYNC_ONE_STEP = 1,        /* Sync timestamp came from a one-step exchange. */
+	APR_SYNC_TWO_STEP = 2,        /* Sync timestamp came from a matched Sync/Follow_Up. */
+};
+
+enum mchp_apr_timestamp_mode {
+	APR_TS_SOFTWARE = 1,  /* Software timestamping. */
+	APR_TS_HARDWARE = 2,  /* Hardware timestamping. */
+	APR_TS_LEGACY_HW = 3, /* Legacy hardware timestamping. */
+	APR_TS_ONESTEP = 4,   /* Hardware one-step timestamping. */
+	APR_TS_P2P1STEP = 5,  /* Hardware P2P one-step timestamping. */
+};
+
+enum mchp_apr_timestamp_status {
+	APR_TS_STATUS_VALID = 1, /* Timestamps in this record are considered valid. */
+};
+
+enum mchp_apr_correction_encoding {
+	/* Signed PTP correction value; one unit represents 2^-16 nanoseconds. */
+	APR_CORRECTION_PTP_SCALED_NS = 1,
+};
+
+struct mchp_apr_timespec_simple {
+	uint64_t tv_sec;
+	uint32_t tv_nsec;
+};
+
+struct mchp_apr_timestamp_msg {
+	uint16_t version; 						/* APR record format version; currently 1. */
+	uint16_t length;  						/* Total record size in bytes; set to sizeof this struct. */
+	uint8_t direction;    					/* APR_FORWARD or APR_REVERSE. */
+	uint8_t domain;       					/* PTP domainNumber of the associated message. */
+	uint16_t sequence_id; 					/* PTP sequenceId of the associated message. */
+	uint8_t source_clock_identity[8]; 		/* Clock identity from sourcePortIdentity. */
+	uint16_t source_port_number;      		/* Port number from sourcePortIdentity. */
+	uint8_t grandmaster_clock_identity[8]; 	/* Selected PTP grandmaster identity. */
+	uint32_t interface_index; 				/* Local interface index; 0 means unavailable. */
+	uint16_t local_port_number; 			/* Local linuxptp PTP port number. */
+	int32_t phc_index;          			/* Local PHC index; -1 means unavailable. */
+	uint8_t sync_mode;          			/* One-step, two-step, or not applicable. */
+	uint8_t timestamping_mode; 				/* Value from enum mchp_apr_timestamp_mode. */
+	uint8_t timestamp_status;  				/* Value from enum mchp_apr_timestamp_status. */
+	uint8_t correction_encoding; 			/* Value from enum mchp_apr_correction_encoding. */
+	struct mchp_apr_timespec_simple rx;		/* RX timestamp: T2 forward, T3 reverse. */
+	struct mchp_apr_timespec_simple tx;		/* TX timestamp: T1 forward, T4 reverse. */
+	int64_t correction;		    			/* Signed PTP correction; units are 2^-16 nanoseconds. */
+};
+#endif
 
 enum syfu_event {
 	SYNC_MISMATCH,
@@ -672,6 +738,111 @@ static void port_stats_inc_tx(struct port *p, const struct ptp_message *msg)
 {
 	p->stats.txMsgType[msg_type(msg)]++;
 }
+
+#ifdef MCHP_APR
+/*
+ * APR timestamp bridge currently supports E2E Sync and Delay_Resp records.
+ * It does not forward Pdelay timestamps or peerMeanPathDelay, so APR P2P
+ * operation is not supported by this interface.
+ */
+static int send_timestamp_to_apr(struct port *p,
+				 enum mchp_apr_direction direction, const struct ptp_message *ptp,
+				 enum mchp_apr_sync_mode sync_mode, tmv_t rx_ts,
+				 struct timestamp tx_ts, int64_t correction)
+{
+	int apr_sockfd;
+	ssize_t sent;
+	struct sockaddr_in dest_addr;
+	struct mchp_apr_timestamp_msg msg;
+	struct mchp_apr_timespec_simple rx, tx;
+	struct timespec rx_temp;
+	struct parent_ds *parent;
+
+
+	rx_temp = tmv_to_timespec(rx_ts);
+	rx.tv_sec = (uint64_t) rx_temp.tv_sec;
+	rx.tv_nsec = (uint32_t) rx_temp.tv_nsec;
+	tx.tv_sec = (uint64_t) tx_ts.sec;
+	tx.tv_nsec = (uint32_t) tx_ts.nsec;
+
+	/* Clear all members and padding before sending the raw struct. */
+	memset(&msg, 0, sizeof(msg));
+	msg.version = 1;
+	msg.length = (uint16_t) sizeof(msg);
+	msg.direction = (uint8_t) direction;
+	msg.domain = ptp->header.domainNumber;
+	msg.sequence_id = ptp->header.sequenceId;
+
+	memcpy(msg.source_clock_identity,
+	       ptp->header.sourcePortIdentity.clockIdentity.id,
+	       sizeof(msg.source_clock_identity));
+
+	msg.source_port_number = ptp->header.sourcePortIdentity.portNumber;
+	parent = clock_parent_ds(p->clock);
+
+	if (parent) {
+		memcpy(msg.grandmaster_clock_identity,
+		       parent->pds.grandmasterIdentity.id,
+		       sizeof(msg.grandmaster_clock_identity));
+	}
+
+	msg.interface_index = if_nametoindex(p->name); /* 0 if unavailable */
+	msg.local_port_number = p->portIdentity.portNumber;
+	msg.phc_index = p->phc_index; /* -1 if unavailable */
+	msg.sync_mode = (uint8_t) sync_mode;
+
+	/* Map linuxptp timestamping modes to the APR protocol values. */
+	switch (p->timestamping) {
+	case TS_SOFTWARE:
+		msg.timestamping_mode = APR_TS_SOFTWARE;
+		break;
+	case TS_HARDWARE:
+		msg.timestamping_mode = APR_TS_HARDWARE;
+		break;
+	case TS_LEGACY_HW:
+		msg.timestamping_mode = APR_TS_LEGACY_HW;
+		break;
+	case TS_ONESTEP:
+		msg.timestamping_mode = APR_TS_ONESTEP;
+		break;
+	case TS_P2P1STEP:
+		msg.timestamping_mode = APR_TS_P2P1STEP;
+		break;
+	default:
+		msg.timestamping_mode = 0; /* Unknown or unsupported. */
+		break;
+	}
+
+	msg.timestamp_status = APR_TS_STATUS_VALID;
+	msg.correction_encoding = APR_CORRECTION_PTP_SCALED_NS;
+	msg.rx = rx;
+	msg.tx = tx;
+	msg.correction = correction;
+
+	pr_debug("APR TX dir=%u domain=%u seq=%u "
+		 "rx=%llu.%09llu tx=%llu.%09llu correction_scaled=%lld",
+		 msg.direction, msg.domain, msg.sequence_id,
+		 (unsigned long long)msg.rx.tv_sec,
+		 (unsigned long long)msg.rx.tv_nsec,
+		 (unsigned long long)msg.tx.tv_sec,
+		 (unsigned long long)msg.tx.tv_nsec,
+		 (long long)msg.correction);
+
+	memset(&dest_addr, 0, sizeof(dest_addr));
+	dest_addr.sin_family = AF_INET;
+	dest_addr.sin_port = htons(config_get_int(clock_config(p->clock), NULL, "apr_timestamp_port"));
+	dest_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	apr_sockfd = clock_get_apr_socket(p->clock);
+
+	sent = sendto(apr_sockfd, &msg, sizeof(msg), 0,
+		      (struct sockaddr *) &dest_addr, sizeof(dest_addr));
+	if (sent != sizeof(msg)) {
+		perror("sendto");
+		return -1;
+	}
+	return 0;
+}
+#endif
 
 static int peer_prepare_and_send(struct port *p, struct ptp_message *msg,
 				 enum transport_event event)
@@ -1559,6 +1730,25 @@ static void port_syfufsm(struct port *p, enum syfu_event event,
 			break;
 		case FUP_MATCH:
 			syn = p->last_syncfup;
+
+			#ifdef MCHP_APR
+			    /*
+				* APR forward record: rx is T2 from the Sync hardware timestamp,
+				* tx is T1 from the matching Follow_Up timestamp. correction is
+				* Sync correction field + Follow_Up correction field.
+ 				*/
+				pr_debug("APR two-step seq=%u T1=%llu.%09u T2_ns=%lld "
+							"sync_corr=%lld fup_corr=%lld total_corr=%lld",
+							syn->header.sequenceId,
+							(unsigned long long)m->ts.pdu.sec, m->ts.pdu.nsec,
+							(long long)tmv_to_nanoseconds(syn->hwts.ts),
+							(long long)syn->header.correction,
+							(long long)m->header.correction,
+							(long long)(syn->header.correction + m->header.correction));
+                send_timestamp_to_apr(p, APR_FORWARD, syn, APR_SYNC_TWO_STEP,
+					                    syn->hwts.ts, m->ts.pdu, syn->header.correction + m->header.correction);
+            #endif
+
 			port_synchronize(p, syn->header.sequenceId,
 					 syn->hwts.ts, m->ts.pdu,
 					 syn->header.correction,
@@ -1582,6 +1772,25 @@ static void port_syfufsm(struct port *p, enum syfu_event event,
 			break;
 		case SYNC_MATCH:
 			fup = p->last_syncfup;
+
+			#ifdef MCHP_APR
+				/*
+				* APR forward record: rx is T2 from the Sync hardware timestamp,
+				* tx is T1 from the matching Follow_Up timestamp. correction is
+				* Sync correction field + Follow_Up correction field.
+ 				*/
+			pr_debug("APR two-step seq=%u T1=%llu.%09u T2_ns=%lld "
+						"sync_corr=%lld fup_corr=%lld total_corr=%lld",
+						m->header.sequenceId,
+						(unsigned long long)fup->ts.pdu.sec, fup->ts.pdu.nsec,
+						(long long)tmv_to_nanoseconds(m->hwts.ts),
+						(long long)m->header.correction,
+						(long long)fup->header.correction,
+						(long long)(m->header.correction + fup->header.correction));
+			    send_timestamp_to_apr(p, APR_FORWARD, m, APR_SYNC_TWO_STEP,
+					                       m->hwts.ts, fup->ts.pdu, m->header.correction + fup->header.correction);
+			#endif
+
 			port_synchronize(p, fup->header.sequenceId,
 					 m->hwts.ts, fup->ts.pdu,
 					 m->header.correction,
@@ -2421,6 +2630,20 @@ void process_delay_resp(struct port *p, struct ptp_message *m)
 	t4 = timestamp_to_tmv(m->ts.pdu);
 	t4c = tmv_sub(t4, c3);
 
+#ifdef MCHP_APR
+	{
+		struct timespec t4c_tmp = tmv_to_timespec(t4c);
+		struct timestamp t4c_ts;
+
+		t4c_ts.sec = t4c_tmp.tv_sec;
+		t4c_ts.nsec = t4c_tmp.tv_nsec;
+		pr_debug("PTP Delay Resp: T4: %llu s %u ns   T3: %lld ns",
+			 (unsigned long long) m->ts.pdu.sec, m->ts.pdu.nsec,
+			 (long long) tmv_to_nanoseconds(t3));
+		send_timestamp_to_apr(p, APR_REVERSE, m, APR_SYNC_NOT_APPLICABLE, t3, m->ts.pdu, m->header.correction);
+	}
+#endif
+
 	monitor_delay(p->slave_event_monitor, clock_parent_identity(p->clock),
 		      m->header.sequenceId, t3, c3, t4);
 
@@ -2469,6 +2692,15 @@ void process_follow_up(struct port *p, struct ptp_message *m)
 	if (check_source_identity(p, m)) {
 		return;
 	}
+
+#ifdef MCHP_APR
+    pr_debug("APR DBG Follow_Up RX: src=%s seq=%u "
+        "preciseOrigin=%llu.%09u correction=%lld",
+        pid2str(&m->header.sourcePortIdentity),
+        m->header.sequenceId,
+        (unsigned long long)m->ts.pdu.sec, m->ts.pdu.nsec,
+        (long long)m->header.correction);
+#endif
 
 	if (p->follow_up_info) {
 		struct follow_up_info_tlv *fui = follow_up_info_extract(m);
@@ -2810,6 +3042,11 @@ void process_sync(struct port *p, struct ptp_message *m)
 	m->header.correction += p->asymmetry;
 
 	if (one_step(m)) {
+
+	#ifdef MCHP_APR
+	    send_timestamp_to_apr(p, APR_FORWARD, m, APR_SYNC_ONE_STEP, m->hwts.ts, m->ts.pdu, m->header.correction);
+    #endif
+
 		port_synchronize(p, m->header.sequenceId,
 				 m->hwts.ts, m->ts.pdu,
 				 m->header.correction, 0,
@@ -3707,6 +3944,13 @@ struct port *port_open(const char *phc_device,
 	p->portIdentity.portNumber = number;
 	p->state = PS_INITIALIZING;
 	p->delayMechanism = config_get_int(cfg, p->name, "delay_mechanism");
+	#ifdef MCHP_APR
+	if (!port_is_uds(p) && p->delayMechanism != DM_E2E) {
+		pr_err("%s: MCHP APR supports only delay_mechanism E2E",
+		       p->log_name);
+		goto err_transport;
+	}
+    #endif
 	p->versionNumber = PTP_MAJOR_VERSION;
 	p->pwr.version =
 		config_get_int(cfg, p->name, "power_profile.version");

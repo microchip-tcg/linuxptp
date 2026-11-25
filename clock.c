@@ -24,6 +24,9 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/queue.h>
+#ifdef MCHP_APR
+#include <sys/socket.h>
+#endif
 #include <sys/stat.h>
 
 #include "address.h"
@@ -151,6 +154,9 @@ struct clock {
 	struct time_zone tz[MAX_TIME_ZONES];
 	struct ClockIdentity ext_gm_identity;
 	int ext_gm_steps_removed;
+#ifdef MCHP_APR
+	int apr_sockfd;
+#endif
 };
 
 struct clock the_clock;
@@ -360,6 +366,11 @@ void clock_destroy(struct clock *c)
 	port_close(c->uds_rw_port);
 	port_close(c->uds_ro_port);
 	free(c->pollfd);
+#ifdef MCHP_APR
+	if (c->apr_sockfd >= 0) {
+		close(c->apr_sockfd);
+	}
+#endif
 	if (c->clkid != CLOCK_REALTIME) {
 		phc_close(c->clkid);
 	}
@@ -1076,6 +1087,13 @@ static void clock_remove_port(struct clock *c, struct port *p)
 	port_close(p);
 }
 
+#ifdef MCHP_APR
+int clock_get_apr_socket(struct clock *c)
+{
+	return c->apr_sockfd;
+}
+#endif
+
 int clock_required_modes(struct clock *c)
 {
 	int required_modes = 0;
@@ -1321,6 +1339,15 @@ struct clock *clock_create(enum clock_type type, struct config *config,
 				   "delay_filter_length", 1)) {
 		return NULL;
 	}
+
+#ifdef MCHP_APR
+	/* Socket for sending time stamps to the Advanced Phase Recovery algorithm. */
+	c->apr_sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (c->apr_sockfd < 0) {
+		pr_err("failed to create timestamp socket: %m");
+		return NULL;
+	}
+#endif
 
 	c->config = config;
 	c->free_running = config_get_int(config, NULL, "free_running");
@@ -2112,6 +2139,9 @@ enum servo_state clock_synchronize(struct clock *c, tmv_t ingress, tmv_t origin)
 	}
 
 	offset = tmv_to_nanoseconds(c->master_offset);
+	#ifdef MCHP_APR
+	pr_info("offset: %" PRId64 " ns", offset);
+    #endif
 	adj = servo_sample(c->servo, offset, tmv_to_nanoseconds(ingress),
 			   weight, &state);
 	c->servo_state = state;
@@ -2120,8 +2150,14 @@ enum servo_state clock_synchronize(struct clock *c, tmv_t ingress, tmv_t origin)
 
 	switch (state) {
 	case SERVO_UNLOCKED:
+	#ifdef MCHP_APR
+		pr_info("SERVO_UNLOCKED");
+	#endif
 		break;
 	case SERVO_JUMP:
+	#ifdef MCHP_APR
+		pr_info("SERVO_JUMP");
+	#else
 		if (clockadj_set_freq(c->clkid, -adj)) {
 			goto servo_unlock;
 		}
@@ -2136,23 +2172,32 @@ enum servo_state clock_synchronize(struct clock *c, tmv_t ingress, tmv_t origin)
 		}
 		tsproc_reset(c->tsproc, 0);
 		clock_step_window(c);
+	#endif
 		break;
 	case SERVO_LOCKED:
+	#ifdef MCHP_APR
+		pr_info("SERVO_LOCKED");
+	#else
 		if (clock_synchronize_locked(c, adj)) {
 			goto servo_unlock;
 		}
+	#endif
 		break;
 	case SERVO_LOCKED_STABLE:
+	#ifdef MCHP_APR
+		pr_info("LOCKED_STABLE");
+	#else
 		if (c->write_phase_mode) {
 			if (clockadj_set_phase(c->clkid, -offset)) {
 				goto servo_unlock;
-			}
+		    }
 			adj = 0;
-		} else {
-			if (clock_synchronize_locked(c, adj)) {
-				goto servo_unlock;
-			}
+		} else { 
+		    if (clock_synchronize_locked(c, adj)) {
+			    goto servo_unlock;
+		    }
 		}
+	#endif
 		break;
 	}
 
