@@ -89,9 +89,9 @@ enum mchp_apr_correction_encoding {
 	APR_CORRECTION_PTP_SCALED_NS = 1,
 };
 
-struct mchp_apr_timespec_simple {
-	uint64_t tv_sec;
-	uint32_t tv_nsec;
+struct mchp_apr_timespec {
+	uint64_t apr_sec;   /* Up to 48-bit seconds */
+	uint32_t apr_nsec;  /* Up to 30-bit sub-seconds in nanoseconds (0 to 999,999,999) */
 };
 
 struct mchp_apr_timestamp_msg {
@@ -110,8 +110,8 @@ struct mchp_apr_timestamp_msg {
 	uint8_t timestamping_mode; 				/* Value from enum mchp_apr_timestamp_mode. */
 	uint8_t timestamp_status;  				/* Value from enum mchp_apr_timestamp_status. */
 	uint8_t correction_encoding; 			/* Value from enum mchp_apr_correction_encoding. */
-	struct mchp_apr_timespec_simple rx;		/* RX timestamp: T2 forward, T3 reverse. */
-	struct mchp_apr_timespec_simple tx;		/* TX timestamp: T1 forward, T4 reverse. */
+	struct mchp_apr_timespec rx;		/* RX timestamp: T2 forward, T3 reverse. */
+	struct mchp_apr_timespec tx;		/* TX timestamp: T1 forward, T4 reverse. */
 	int64_t correction;		    			/* Signed PTP correction; units are 2^-16 nanoseconds. */
 };
 #endif
@@ -754,16 +754,16 @@ static int send_timestamp_to_apr(struct port *p,
 	ssize_t sent;
 	struct sockaddr_in dest_addr;
 	struct mchp_apr_timestamp_msg msg;
-	struct mchp_apr_timespec_simple rx, tx;
+	struct mchp_apr_timespec rx, tx;
 	struct timespec rx_temp;
 	struct parent_ds *parent;
 
 
 	rx_temp = tmv_to_timespec(rx_ts);
-	rx.tv_sec = (uint64_t) rx_temp.tv_sec;
-	rx.tv_nsec = (uint32_t) rx_temp.tv_nsec;
-	tx.tv_sec = (uint64_t) tx_ts.sec;
-	tx.tv_nsec = (uint32_t) tx_ts.nsec;
+	rx.apr_sec = (uint64_t) rx_temp.tv_sec;
+	rx.apr_nsec = (uint32_t) rx_temp.tv_nsec;
+	tx.apr_sec = (uint64_t) tx_ts.sec;
+	tx.apr_nsec = (uint32_t) tx_ts.nsec;
 
 	/* Clear all members and padding before sending the raw struct. */
 	memset(&msg, 0, sizeof(msg));
@@ -822,10 +822,10 @@ static int send_timestamp_to_apr(struct port *p,
 	pr_debug("APR TX dir=%u domain=%u seq=%u "
 		 "rx=%llu.%09llu tx=%llu.%09llu correction_scaled=%lld",
 		 msg.direction, msg.domain, msg.sequence_id,
-		 (unsigned long long)msg.rx.tv_sec,
-		 (unsigned long long)msg.rx.tv_nsec,
-		 (unsigned long long)msg.tx.tv_sec,
-		 (unsigned long long)msg.tx.tv_nsec,
+		 (unsigned long long)msg.rx.apr_sec,
+		 (unsigned long long)msg.rx.apr_nsec,
+		 (unsigned long long)msg.tx.apr_sec,
+		 (unsigned long long)msg.tx.apr_nsec,
 		 (long long)msg.correction);
 
 	memset(&dest_addr, 0, sizeof(dest_addr));
